@@ -1,0 +1,460 @@
+'Control Program for Dynamic Ecosystem Labeling (DEL) System
+'v1.0
+'CR1000
+'University of California, Berkeley
+'Don Herman and Katerina Estera-Molina
+'2017-02-15, 2017-02-22
+'v1.00: Valve control module created
+'v1.01: Temperature probe module created
+'v1.02: CO2 control added
+'v1.03: Second IRGA added on SE 4
+'v1.04: Code for second IRGA removed
+'      Code for Picarro added
+'v1.05: 2017-07-03 Both IRGA and Picarro are implemented
+'v1.06: Constant CO2 supply
+'v1.07: Delay in logging CO2 from SS2; ValvePop adjusted based on CO2 ppm
+'v1.08: Threshold for max (600 ms) and min (100 ms) solenoid opening; now using ValvePop constant to calculate ms value
+'v1.09: Set initial SSX_Valve_ms to 0 to allow program to be recompiled without adding CO2
+'v1.10: Set SSX_Valve_ms at each cycle = ValvePop (300 ms) + 200 ms * (CO2 setpoint - CO2 reading)/(CO2 setpoint)
+'next version: only add CO2 every other reading?
+'could later solenoids be getting lower pressure CO2 supply than solenoids that are earlier in the firing sequence?
+'v.1.11: Delay added after solenoid closes (since removed)
+'v1.12: Set SSX_Valve_ms at each cycle = ValvePop (400 ms) + ValvePop * (CO2 setpoint - CO2 reading)/(CO2 setpoint), ms < MinValvePop set = MinValvePop
+'v1.13: "ToAdd" boolean to add CO2 every other cycle (removed; PS increased), no CO2 addition flag at ppm > 1200
+'v1.14: Set Valve_ms=0 if chamber above CO2 setpoint for tracking, ValveRange variable added to ValvePop depending on [CO2], ms_i sets initial ms for all chambers
+'v1.15: Using 20 scans of 15s per chamber, averaging from scan 11 through 13
+'v1.16: Adjusts SS2_Valve_ms in relation to CO2 measurement from current cycle, CO2 measurement from previous cycle, and setpoint
+'        Reverses v1.12 and v1.14
+'v1.17: Bases millisecond calculation upon projection of ppm CO2 measured at the next cycle
+'v1.18: Adds CO2 at end of each cycle (removed v1.13)
+'v1.19: ppm_per_msec added as a constant: the average amount that CO2 concentration in the chamber is raised per msec of solenoid opening
+'v1.20: 1. Move CO2 addition to a called subroutine (Add_CO2)
+'       2. Remove conditional that sets solenoid milleseconds to 0 when the new calculation is < 0
+'v1.21: Actuate one solenoid at the end of each scan (up to 16 scans), rather than all solenoids at the end of each cycle
+'v1.22: Orphaned variables and comments removed
+'v1.23: Added the solenoid timing update for the IRGA
+'v1.24 Renamed subroutine varialbes and chamged temperature subscan repetitions from 32 to 16 and added SS1or2_Valve_ms to data table
+'v1.25 Code revised by Jason Ritter (Campbell) to include PreserveVariables
+'v1.26 Adding adding Licor command and par multiplier code for milisec open (KEM)and units temperature and PAR
+'v2.01 Integrate PAR measurement into solenoid calculation
+'v2.02 Initializes prev_IRGA_ppm and prev_Pic_ppm with CO2 measured at beginning of program execution
+'v3.01 Solenoid milliseconds is linearly related to PAR, but adjusted each suite based on measured CO2
+'v3.02 Prev_ppm removed from code
+'v3.04 Changing SS1(or2)_Relative_Deviation from a per chamber basis to a per suite basis under "Ca;culate the new solenoid corrections..."
+'v3.05 adding Tensiometer T4 command code for soil water potential (KEM): converts bridge measurement to kPa (multiplier of -10.6)
+
+'Digital I/O ports:
+'C1, C2, C3: SDM-CD16
+'   SC0 is relay bank for Sample Stream 1
+'   SC1 is relay bank for Sample Stream 2
+'C4: AM16/32B CLK
+'C5, C6 (COM3): Sample Selector Valves - Tx: Red; Rx: Brn; Gn: Yel
+'  Valve1, 01-16, ID1
+'  Valve2, 01-16, ID2
+'  Valve3, 17-32, ID3
+'  Valve4, 17-32, ID4
+'C7, C8 (COM4): Picarro - Tx: Brn; Rx Red; Gn: Yel
+
+'Analog channels:
+'  Temperatures 1 - 16 on SE1
+'  Temperatures 17 - 32 on SE2
+'  IRGA_1 on SE3
+'  CO2 cylinder pressure on SE5
+'  Pressure controller for Picarro on SE6
+
+'Datalogger - Multiplexer Connections:
+'  CR1000    AM16/32B
+'  C4        RES
+'  VX3       CLK
+'  G         G
+'  12V       12V
+'  SE1       COM ODD H
+'  VX1       COM ODD L
+
+'T4 connections on Datalogger
+  'T4.1: Bottom 4 pin connector
+    'Brown (supply +) to VX2
+    'Blue (supply -) to Gnd
+    'White (signal +) to 9H
+    'Black (signal -) to 10L
+    'Thick black (shield) to Gnd
+ 
+  'T4.2: Top 4 pin connector
+    'Brown (supply +) to VX1
+    'Blue (supply -) to Gnd
+    'White (signal +) to 1H
+    'Black (signal -) to 1L
+    'Thick black (shield) to Gnd
+
+'Dimensioning CO2_to_log: Begin with last chamber
+
+'PreserveVariables 'Added by Jason Ritter, CSI, 25 Jan 2018
+
+'Declare Constants
+Const N_of_Cycles = 16  'Total number of cycles, i.e. number of enriched and natural abundance chamber pairs
+Const ScansPerCham = 20 'Number of scans to monitor each chamber
+Const ScanInt = 15 'The interval, in seconds, between successive scans
+Dim ChambersUsed_SS1(N_of_Cycles) = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16} 'Which Sample Stream 1 chambers are to be used (Range is 1 - 16)
+Dim ChambersUsed_SS2(N_of_Cycles) = {17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32} 'Which Sample Stream 2 chambers are to be used (Range is 17 - 32)
+Dim CO2_to_Log(N_of_Cycles) = {16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15} 'Attribute the current CO2 measurement to this chamber
+Dim CO2_Setpoint_SS1(N_of_Cycles) = {400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400} 'CO2 Setpoints for Sample Stream 1 (Chambers 1-16)
+Dim CO2_Setpoint_SS2(N_of_Cycles) = {400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400} 'CO2 Setpoints for Sample Stream 2 (Chambers 17-32)
+Const StartAvgAt = 11
+Const EndAvgAt = 14
+Const SS1_Flag_Limit = 700 'Do not add any CO2 if measured CO2 is above this value
+Const SS2_Flag_Limit = 700 'Do not add any CO2 if measured CO2 is above this value
+Const SS1_ms_Upper_Limit = 400 'Maximum amount of time solenoid can be held open
+Const SS2_ms_Upper_Limit = 400 'Maximum amount of time solenoid can be held open
+Const SS1_ms_Lower_Limit = 2 'Do not actuate a solenoid if calculated milliseconds is below this limit
+Const SS2_ms_Lower_Limit = 2 'Do not actuate a solenoid if calculated milliseconds is below this limit
+Const ms_i = 30 ' Starting milliseconds for how long to keep solenoids open
+Const IRGA_ppm_per_msec = 0.5 'amount (ppm) that CO2 in the chamber is raised per millisecond of solenoid opening(i.e.SS1_Valve_ms or SS2_Valve_ms)
+Const Pic_ppm_per_msec = 0.65 'amount (ppm) that CO2 in the chamber is raised per millisecond of solenoid opening(i.e.SS1_Valve_ms or SS2_Valve_ms)
+Dim Pic_Vars(8) As String * 20 'The input string from the Picarro will be parsed into this array
+'The column headings are: HP12CH4; iCH4_dry; HR12CH4; HR_Delta_iCH4_30s; H2O; 12CO2; 13CO2; Delta_Raw_iCO2
+Const IRGA_1_Offset = 0
+Const IRGA_1_Slope = 2000/5000 'ppm/mV for 0 - 2000 ppm input range per 0 - 5000 mV output range
+Dim Valve_1_2_PosStr(16) As String = {"01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16"} 'IRGA Ports
+Dim Valve_3_4_PosStr(16) As String = {"17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32"} 'Picarro Ports
+Const PAR_Calibration = 4.476 'mV / (mmol per m2 per s)
+Const PAR_Coefficient = 1000 / PAR_Calibration 'used in Volt_Diff instruction
+Const PAR_Flag_Limit = 50 'Don't add CO2 if PAR is lower than this value
+
+'Declare Public Variables
+Public PTemp, batt_volt
+Public SC0(16), SC1(16) 'Relay states for CO2 solenoids; 0 = open the relay (close the solenoid), 1 = close the relay (open the solenoid)
+Public Valve1Pos As String * 8,Valve2Pos As String * 8, Valve3Pos As String * 8,Valve4Pos As String * 8
+Public CycleIndex 'A full cycle is the number of chamber pairs ((enriched + natural abundance) / 2) being processed
+'CycleIndex is where we are in the cycle, in other words, which pair of chambers is being processed
+Public ScansPerCycle, ChamberScanIndex, ActiveChamberSS1, ActiveChamberSS2' SS1 and SS2 are Sample Stream 1 & Sample Stream 2
+Public P_Ctrl 'Picarro pressure controller
+Public CO2_1_ppm, IRGA_1_mV, IRGA_1_CO2(N_of_Cycles), Picarro_CO2(N_of_Cycles)
+Public ScansToAvg
+Public i 'Mainly a for...next index
+Public Chamber_T (32)
+Public InputString As String * 500 'Declare a string variable large enough to hold the Picarro's output string
+Public Pic_Avg_Count, IRGA_Avg_Count
+Public CO2_12_ppm, CO2_13_ppm, Picarro_Temp_CO2, Total_Picarro_CO2_ppm, IRGA_Temp_CO2, Atom_Pct_CO2, H2O_Pct 'Picarro input
+Public CO2_Cyl_Press 'CO2 cylinder pressure on SE5
+Public SS1_Addition_Flag(N_of_Cycles) As Boolean = {True, True, True, True, True, True, True, True, True, True, True, True, True, True, True}
+Public SS2_Addition_Flag(N_of_Cycles) As Boolean = {True, True, True, True, True, True, True, True, True, True, True, True, True, True, True}
+Public Deviation_IRGA_ppm ' for the IRGA, difference between currently measured CO2 and setpoint
+Public Deviation_Pic_ppm ' for the Picarro, difference between currently measured CO2 and setpoint
+Public SS1_Valve_ms(N_of_Cycles) = {ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i} ' Applying starting ms value to all 12C columns
+Public SS2_Valve_ms(N_of_Cycles) = {ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i, ms_i} ' Applying starting ms value to all 13C columns
+Public PAR_In
+Public PAR_Den (N_of_Cycles) 'PAR photon flux density umol/s/m2
+Public SS1_Adjusted_ms, SS2_Adjusted_ms 'Solenoid ms passed to Add_CO2 subroutine
+Public SS1_Cycle_ms_Average(N_of_Cycles), SS2_Cycle_ms_Average(N_of_Cycles) 'Average ms additions for the cycle (informatin only)
+Public SS1_CO2_Assimilated, SS2_CO2_Assimilated 'estimate of net CO2 assimilated during one cycle
+Public SS1_Relative_Deviation(N_of_Cycles), SS2_Relative_Deviation(N_of_Cycles) 'Ratio of deviation from setpoint / setpoint
+Public ACO2_f_PAR = 0.048 'net ACO2_ppm (during the period ScanInt x ScansPerCham) as a function of PAR (umol/m2/s) =69.3/1440
+Public T4E_1_kPa
+Public T4E_2_kPa
+
+
+Units PAR_Den=umol/s/m^2
+Units Chamber_T()=°C
+Units PTemp=°C
+Units batt_volt=V
+Units T4E_1_kPa=kPa
+Units T4E_2_kPa=kPa
+
+'Define Data Tables.
+DataTable (Phage_Fauna_L2,1,-1) 'Set table size to # of records, or -1 to autoallocate.
+'  DataInterval (0,1,hr,10)
+  Minimum (1,batt_volt,FP2,False,False)
+  Sample (1,PTemp,FP2)
+  Sample (1,P_Ctrl,FP2)
+  Sample (1,T4E_1_kPa, IEEE4)
+  Sample (1,T4E_2_kPa, IEEE4)
+  Sample (1,Valve1Pos,String)
+  Sample (1,Valve2Pos,String)
+  Sample (1,Valve3Pos,String)
+  Sample (1,Valve4Pos,String)
+  Sample (1,PAR_In,IEEE4)
+  Sample (1,InputString,String)
+  Sample (1,CO2_12_ppm,FP2)
+  Sample (1,CO2_1_ppm,FP2)
+  Sample (1,IRGA_1_mV,FP2)
+  Sample (N_of_Cycles,IRGA_1_CO2(),FP2)
+  Sample (N_of_Cycles,Picarro_CO2(),FP2)
+  Sample (N_of_Cycles,SS1_Valve_ms(),FP2)
+  Sample (N_of_Cycles,SS2_Valve_ms(),FP2)
+  Sample (1,Atom_Pct_CO2,FP2)
+  Sample (1,H2O_Pct,FP2)
+  Sample (1,CO2_Cyl_Press,FP2)
+  Sample (32,Chamber_T(),FP2)
+  Sample (N_of_Cycles,PAR_Den(),FP2)
+
+EndTable
+
+DataTable (Solenoid_History,1,-1)
+'  DataInterval (1,5,min,10)
+  Sample(N_of_Cycles,SS1_Cycle_ms_Average(),FP2)
+  Sample(N_of_Cycles,SS2_Cycle_ms_Average(),FP2)
+EndTable
+
+DataTable(Adj_ms,1,-1)
+'  DataInterval (0,1,hr,10)
+  Sample(N_of_Cycles,SS1_Valve_ms(),FP2)
+  Sample(N_of_Cycles,SS2_Valve_ms(),FP2)
+EndTable
+
+
+'Define Subroutines
+Sub Add_CO2(ScanIndex, SS1_Flag(N_of_Cycles), SS2_Flag(N_of_Cycles), SS1_Adjusted_ms, SS2_Adjusted_ms
+  'Add CO2 to all chambers with True flags
+  '+++IRGA+++
+  If SS1_Flag(ScanIndex) = True Then
+    SC0(ScanIndex) = 1
+    If SS1_Adjusted_ms = 0 Then SC0(ScanIndex) = 0 'Keep valve closed if ValvePop = 0 ms
+    SDMCD16AC (SC0(),1,0) 'Open the CO2 valve otherwise
+    Delay (1,SS1_Adjusted_ms,mSec)
+    SC0(ScanIndex) = 0
+    SDMCD16AC (SC0(),1,0) 'Close the CO2 valve
+  EndIf
+  '+++Picarro+++
+  If SS2_Flag(ScanIndex) = True Then
+    SC1(ScanIndex) = 1
+    If SS2_Adjusted_ms = 0 Then SC1(ScanIndex) = 0 'Keep valve closed if ValvePop = 0 ms
+    SDMCD16AC (SC1(),1,1) 'Open the CO2 valve otherwise
+    Delay (1,SS2_Adjusted_ms,mSec)
+    SC1(ScanIndex) = 0
+    SDMCD16AC (SC1(),1,1) 'Close the CO2 valve
+  EndIf
+EndSub
+
+'Main Program
+
+BeginProg
+  '-----------------------------------------
+  'Collect baseline CO2 measurements
+  '-----------------------------------------
+ 'Collect 8 minutes worth of baseline CO2 data
+  i = 0
+  Scan (15,Sec,3,32)
+    i = i + 1
+    'Read the IRGA
+    VoltSe (IRGA_1_mV,1,mV5000,3,0,0,60,1.0,0)
+    CO2_1_ppm = IRGA_1_Offset + IRGA_1_Slope * IRGA_1_mV
+
+    'Read the Picarro
+    SerialOpen(com4,19200,3, 0, 1000)
+    SerialOut(com4,"_Meas_GetConc"&CHR(13)&CHR(10) ,"",0,10)
+    SerialIn (InputString,com4,100,013,500)
+    SplitStr (Pic_Vars(),InputString,";",8,5)
+    CO2_12_ppm = Pic_Vars(6)    
+    CO2_13_ppm = Pic_Vars(7)
+    Total_Picarro_CO2_ppm = CO2_12_ppm + CO2_13_ppm
+
+    'Sum the IRGA and Picarro CO2 measurements    
+    If i > 28 Then
+      IRGA_Temp_CO2 = IRGA_Temp_CO2 + CO2_1_ppm
+      IRGA_Avg_Count = IRGA_Avg_Count + 1
+      Picarro_Temp_CO2 = Picarro_Temp_CO2 + Total_Picarro_CO2_ppm
+      Pic_Avg_Count = Pic_Avg_Count + 1
+    EndIf
+  Next Scan
+
+  'Compute the average of the initial CO2 measurements
+  IRGA_Temp_CO2 = IRGA_Temp_CO2 / IRGA_Avg_Count
+  Picarro_Temp_CO2 = Picarro_Temp_CO2 / Pic_Avg_Count
+
+   '-----------------------------------------
+  'Initialize Variables
+  '-----------------------------------------
+  VoltDiff(PAR_In,1,mv25,4,True,0,_60Hz,PAR_Coefficient,0) 'PAR measurement on Differential channel 4
+  If PAR_In = NAN Then PAR_In = 1800
+  Valve1Pos = ""
+  Valve2Pos = ""
+  Valve3Pos = ""
+  Valve4Pos = ""
+  ScansToAvg = EndAvgAt - StartAvgAt
+  CycleIndex = N_of_Cycles + 1 'Starting value for Active Chamber. Index will reset to 1 on the first scan.
+  ChamberScanIndex = ScansPerCham + 1  'Starting value for the chamber scan index. Index will reset to 1 on the first scan.
+  ScansPerCycle = N_of_Cycles * ScansPerCham
+  For i = 1 To N_of_Cycles
+    PAR_Den(i) = PAR_In
+    'Initialize solenoid timing
+    SS1_Valve_ms(i) = ms_i
+    SS2_Valve_ms(i) = ms_i
+    'Check for non-positive CO2 addtions
+    If SS1_Valve_ms(i) <=0 Then SS1_Addition_Flag(i) = False
+    If SS2_Valve_ms(i) <=0 Then SS2_Addition_Flag(i) = False
+    'Start with all relays closed
+    SDMCD16AC (SC0(),1,0)
+    SDMCD16AC (SC1(),1,1)
+    'Start with the cycle ms average = 0
+    SS1_Cycle_ms_Average(i) = 0
+    SS2_Cycle_ms_Average(i) = 0
+  Next i
+  'Because the last Picarro chamber needs a starting CO2 concentration:
+  Picarro_CO2(N_of_Cycles) = Picarro_Temp_CO2
+
+  '-----------------------------------------
+  'Begin Routine Scans
+  '-----------------------------------------
+  Scan (ScanInt,Sec,0,0)
+    PanelTemp (PTemp,250)
+    Battery (batt_volt)
+    VoltSe (CO2_Cyl_Press,1,mV5000,5,1,0,60,0.6,-4)
+    VoltSe (P_Ctrl,1,mV5000,6,1,0,60,0.2,0) 'Pressure controller (torr) Output range is 0-5000mV ~ 0-1000 torr, ie 0.2mV/torr
+    BrFull(T4E_1_kPa, 1, mV2500, 1, Vx2, 1, 2500, True, True, 0, _60Hz, -10.6, 0)'multiplier of 10.6 converts to kPa
+    BrFull(T4E_2_kPa, 1, mV2500, 1, Vx2, 1, 2500, True, True, 0, _60Hz, -10.6, 0)'multiplier of 10.6 converts to kPa
+    VoltDiff(PAR_In,1,mv25,4,True,0,_60Hz,PAR_Coefficient,0) 'Read PAR on Differential channel 4, umol/m2/s
+    If PAR_In = NAN Then PAR_In = 1800
+
+    '-----------------------------------------
+    'Initialize Suite and Select Chambers
+    '-----------------------------------------
+    If ChamberScanIndex >= ScansPerCham Then
+      If CycleIndex >= N_of_Cycles Then
+        CallTable Solenoid_History
+        CycleIndex = 1
+      Else
+        CycleIndex = CycleIndex + 1
+      End If
+      ActiveChamberSS1 = ChambersUsed_SS1(CycleIndex)
+      ActiveChamberSS2 = ChambersUsed_SS2(CycleIndex)
+      Pic_Avg_Count = 0
+      IRGA_Avg_Count = 0
+      IRGA_1_CO2(CycleIndex) = 0
+      IRGA_Temp_CO2 = 0
+      Picarro_Temp_CO2 = 0
+      Picarro_CO2(CO2_to_Log(CycleIndex)) = 0
+      SS1_Cycle_ms_Average(CycleIndex) = 0
+      SS2_Cycle_ms_Average(CO2_to_Log(CycleIndex)) = 0
+      ChamberScanIndex = 1
+      SerialOpen(COM3, 9600, 0, 0, 100)              'Open COM port to valves
+      'Actuate the valves for Sample Stream 1
+      SerialOut (COM3,"1GO"&Valve_1_2_PosStr(ActiveChamberSS1)&CHR(13)&CHR(10),"",0,10)  'Turn Valve 1 to Active Chamber
+      Delay (0,750,mSec)
+      SerialOut(COM3,"1CP"&CHR(13)&CHR(10) ,"",0,10) 'Probe for current Valve0 position
+      SerialIn (Valve1Pos,COM3,100,0,10) 		       'Read current Valve0 position
+      SerialOut (COM3,"2GO"&Valve_1_2_PosStr(ActiveChamberSS1)&CHR(13)&CHR(10),"",0,10)  'Turn Valve 2 to Active Chamber
+      Delay (0,750,mSec)
+      SerialOut(COM3,"2CP"&CHR(13)&CHR(10) ,"",0,10) 'Probe for current Valve1 position
+      SerialIn (Valve2Pos,COM3,100,0,10) 		       'Read current Valve0 position
+      'Actuate the valves for Sample Stream 2
+      SerialOut (COM3,"3GO"&Valve_3_4_PosStr(ActiveChamberSS2-16)&CHR(13)&CHR(10),"",0,10)  'Turn Valve 3 to Active Chamber
+      Delay (0,750,mSec)
+      SerialOut(COM3,"3CP"&CHR(13)&CHR(10) ,"",0,10) 'Probe for current Valve0 position
+      SerialIn (Valve3Pos,COM3,100,0,10) 		       'Read current Valve0 position
+      SerialOut (COM3,"4GO"&Valve_3_4_PosStr(ActiveChamberSS2-16)&CHR(13)&CHR(10),"",0,10)  'Turn Valve 4 to Active Chamber
+      Delay (0,750,mSec)
+      SerialOut(COM3,"4CP"&CHR(13)&CHR(10) ,"",0,10) 'Probe for current Valve1 position
+      SerialIn (Valve4Pos,COM3,100,0,10) 		       'Read current Valve0 position
+    Else
+      ChamberScanIndex = ChamberScanIndex + 1
+    End If
+
+    '-----------------------------------------
+    'Read Temperature
+    '-----------------------------------------
+    PortSet (4 ,1 )
+    Delay (0,150,mSec)
+    i = 1
+    SubScan (0,Sec,16)
+      ExciteV (Vx3,2500,20000)
+      Therm107 (Chamber_T(i),1,1,Vx1,0,_60Hz,1.0,0)
+      Therm107 (Chamber_T(i + 16),1,2,Vx1,0,_60Hz,1.0,0)
+      i = i + 1
+    NextSubScan
+    PortSet (4 ,0)
+
+    '-----------------------------------------
+    'Read CO2 Sample Stream 1 (IRGA)
+    '-----------------------------------------
+    VoltSe (IRGA_1_mV,1,mV5000,3,0,0,60,1.0,0)
+    CO2_1_ppm = IRGA_1_Offset + IRGA_1_Slope * IRGA_1_mV
+    'Sum the IRGA CO2 measurements
+    If ChamberScanIndex >= StartAvgAt Then
+      IRGA_Temp_CO2 = IRGA_Temp_CO2 + CO2_1_ppm
+      IRGA_Avg_Count = IRGA_Avg_Count + 1
+    EndIf
+    'Average the IRGA CO2 measurements and update solenoid timing
+    If ChamberScanIndex = EndAvgAt Then
+      'Log the IRGA CO2 concentration
+      IRGA_1_CO2(CycleIndex) = IRGA_Temp_CO2 / IRGA_Avg_Count
+      '-----------------------------------------
+      'Calculate the new solenoid correction for SS1
+      '-----------------------------------------
+      Deviation_IRGA_ppm = CO2_Setpoint_SS1(CycleIndex) - IRGA_1_CO2(CycleIndex)
+      SS1_Relative_Deviation(CycleIndex) = Deviation_IRGA_ppm / CO2_Setpoint_SS1(CycleIndex) / N_of_Cycles
+    EndIf
+
+    '-----------------------------------------
+    'Read CO2 Sample Stream 2 (Picarro)
+    '-----------------------------------------
+    SerialOpen(com4,19200,3, 0, 1000)
+    SerialOut(com4,"_Meas_GetConc"&CHR(13)&CHR(10) ,"",0,10)
+    SerialIn (InputString,com4,100,013,500)
+    SplitStr (Pic_Vars(),InputString,";",8,5)
+    H2O_Pct = Pic_Vars(5)
+    CO2_12_ppm = Pic_Vars(6)
+    CO2_13_ppm = Pic_Vars(7)
+    Total_Picarro_CO2_ppm = CO2_12_ppm + CO2_13_ppm
+    Atom_Pct_CO2 = 100 * CO2_13_ppm / Total_Picarro_CO2_ppm
+    'Sum the Picarro CO2 Measurements
+    If ChamberScanIndex >= StartAvgAt Then
+      Picarro_Temp_CO2 = Picarro_Temp_CO2 + Total_Picarro_CO2_ppm
+      Pic_Avg_Count = Pic_Avg_Count + 1
+    EndIf
+    'Average the Picarro CO2 Measurements and update solenoid timing
+    If ChamberScanIndex = EndAvgAt Then
+      'Log the Picarro CO2 concentration
+      Picarro_CO2(CO2_to_Log(CycleIndex)) = Picarro_Temp_CO2 / Pic_Avg_Count
+      '-----------------------------------------
+      'Calculate the new solenoid correction for SS2
+      '-----------------------------------------
+      Deviation_Pic_ppm =  CO2_Setpoint_SS2(CO2_to_Log(CycleIndex)) - Picarro_CO2(CO2_to_Log(CycleIndex))
+      SS2_Relative_Deviation(CycleIndex) = Deviation_Pic_ppm / CO2_Setpoint_SS2(CycleIndex) / N_of_Cycles
+    EndIf
+
+    'Update PAR_Den
+    If ChamberScanIndex = EndAvgAt Then PAR_Den(CycleIndex) = PAR_In
+
+    '------------------------------------------------------------
+    'Calculate soelnoid timing, set flags, and call CO2 additions
+    '------------------------------------------------------------
+    If ChamberScanIndex <= N_of_Cycles Then
+      'Adjust solenoid ms for ACO2
+      SS1_CO2_Assimilated = PAR_In * ACO2_f_PAR
+      SS1_Valve_ms(ChamberScanIndex) = SS1_CO2_Assimilated / IRGA_ppm_per_msec
+      SS1_Adjusted_ms = SS1_Valve_ms(ChamberScanIndex) + SS1_Valve_ms(ChamberScanIndex) * SS1_Relative_Deviation(ChamberScanIndex)
+      SS2_CO2_Assimilated = PAR_In * ACO2_f_PAR
+      SS2_Valve_ms(ChamberScanIndex) = SS2_CO2_Assimilated / Pic_ppm_per_msec
+      SS2_Adjusted_ms = SS2_Valve_ms(ChamberScanIndex) + SS2_Valve_ms(ChamberScanIndex) * SS2_Relative_Deviation(ChamberScanIndex)
+      If SS1_Adjusted_ms > SS1_ms_Upper_Limit Then SS1_Adjusted_ms = SS1_ms_Upper_Limit
+      If SS2_Adjusted_ms > SS2_ms_Upper_Limit Then SS2_Adjusted_ms = SS2_ms_Upper_Limit
+      SS1_Cycle_ms_Average(ChamberScanIndex) = SS1_Cycle_ms_Average(ChamberScanIndex) + (SS1_Adjusted_ms / N_of_Cycles)
+      SS2_Cycle_ms_Average(ChamberScanIndex) = SS2_Cycle_ms_Average(ChamberScanIndex) + (SS2_Adjusted_ms / N_of_Cycles)
+      'Constrain the solenoid ms:
+      '+++Set Flags for IRGA+++
+      SS1_Addition_Flag(ChamberScanIndex) = True 'Reset the flag to true
+      If PAR_In < PAR_Flag_Limit Then SS1_Addition_Flag(ChamberScanIndex) = False 'Don't add CO2 if PAR is too low
+      If SS1_Adjusted_ms < SS1_ms_Lower_Limit Then SS1_Addition_Flag(ChamberScanIndex) = False 'Don't add CO2 if solenoid milliseconds is already low
+      If IRGA_1_CO2(ChamberScanIndex) > SS1_Flag_Limit Then SS1_Addition_Flag(ChamberScanIndex) = False 'Don't add any CO2 if the chamber CO2 level is already too high
+      If SS1_Valve_ms(ChamberScanIndex) <= 0 Then 'If the new solenoid milliseconds is negative...
+        SS1_Valve_ms(ChamberScanIndex) = 1 'This will need to be a positive value for the next time the valve milliseconds is recalculated
+        SS1_Addition_Flag(ChamberScanIndex) = False 'But don't add any CO2
+      EndIf
+      '+++Set Flags for Picarro+++
+      SS2_Addition_Flag(CO2_to_Log(ChamberScanIndex)) = True 'Reset the flag to true
+      If PAR_In < PAR_Flag_Limit Then SS2_Addition_Flag(ChamberScanIndex) = False 'Don't add CO2 if PAR is too low
+      If SS2_Adjusted_ms < SS2_ms_Lower_Limit Then SS2_Addition_Flag(ChamberScanIndex) = False 'Don't add CO2 if solenoid milliseconds is already low
+      If Picarro_CO2(CO2_to_Log(ChamberScanIndex)) > SS2_Flag_Limit Then SS2_Addition_Flag(CO2_to_Log(ChamberScanIndex)) = False 'Don't add any CO2 if the chamber CO2 level is already too high
+      If SS2_Valve_ms(CO2_to_Log(ChamberScanIndex)) <= 0 Then 'If the new solenoid milliseconds is negative...
+        SS2_Valve_ms(CO2_to_Log(ChamberScanIndex)) = 1 'This will need to be a positive value for the next time the valve milliseconds is recalculated
+        SS2_Addition_Flag(CO2_to_Log(ChamberScanIndex)) = False 'But don't add any CO2
+      EndIf
+      '+++Add CO2 to the chamber(s) whose numbers match the scan index+++
+      Call Add_CO2 (ChamberScanIndex, SS1_Addition_Flag(), SS2_Addition_Flag(), SS1_Adjusted_ms, SS2_Adjusted_ms 'Decisions to add CO2 to chambers
+    EndIf
+    If ChamberScanIndex >= ScansPerCham Then
+      CallTable Phage_Fauna_L2
+      CallTable Adj_ms
+    EndIf
+  NextScan
+EndProg
